@@ -14,6 +14,7 @@ export interface Env {
   AI: Ai;
   AUTH_TOKEN: string;
   OAUTH_KV: KVNamespace;
+  VECTORIZE_GRACE_MS?: string;
 }
 
 const LLM_MODEL = "@cf/meta/llama-4-scout-17b-16e-instruct";
@@ -25,6 +26,10 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept",
 };
+
+function graceMs(env: Env): number {
+  return parseInt(env.VECTORIZE_GRACE_MS ?? "300000", 10) || 300000;
+}
 
 // ─── Thresholds ───────────────────────────────────────────────────────────────
 
@@ -512,7 +517,7 @@ export function buildEntryFilterQuery(params: {
   if (params.after !== undefined) { conds.push(`created_at >= ?`); bindings.push(params.after); }
   if (params.before !== undefined) { conds.push(`created_at <= ?`); bindings.push(params.before); }
 
-  let sql = `SELECT id, content, tags, source, created_at FROM entries`;
+  let sql = `SELECT id, content, tags, source, created_at, vector_ids FROM entries`;
   if (conds.length) sql += ` WHERE ` + conds.join(` AND `);
   sql += ` ORDER BY created_at DESC LIMIT ?`;
   bindings.push(params.n);
@@ -1603,8 +1608,13 @@ const defaultHandler = {
     if (url.pathname === "/stats" && request.method === "GET") {
       const authErr = requireAuth(request, env);
       if (authErr) return authErr;
+      const graceCutoff = Date.now() - graceMs(env);
       const [summary, tagRows, candidateRows] = await Promise.all([
-        env.DB.prepare(`SELECT COUNT(*) as count, AVG(importance_score) as avg_importance FROM entries`).first() as Promise<Record<string, any> | null>,
+        env.DB.prepare(
+          `SELECT COUNT(*) as count, AVG(importance_score) as avg_importance,
+           SUM(CASE WHEN vector_ids = '[]' AND created_at < ? THEN 1 ELSE 0 END) as unvectorized
+           FROM entries`
+        ).bind(graceCutoff).first() as Promise<Record<string, any> | null>,
         env.DB.prepare(`SELECT value, COUNT(*) as n FROM entries, json_each(entries.tags) GROUP BY value ORDER BY n DESC LIMIT 5`).all(),
         env.DB.prepare(`
           SELECT value as tag, COUNT(*) as count
@@ -1635,6 +1645,8 @@ const defaultHandler = {
         avg_importance: summary?.avg_importance != null ? Math.round((summary.avg_importance as number) * 10) / 10 : null,
         top_tags: (tagRows.results as any[]).map(r => r.value as string),
         digest_candidates: digestCandidates,
+        unvectorized: (summary?.unvectorized as number) ?? 0,
+        vectorize_grace_ms: graceMs(env),
       });
     }
 
@@ -1746,6 +1758,46 @@ const defaultHandler = {
       }
 
       return json({ tag, synthesis: result.text, entry_id: result.synthesizedId, source_count: result.entriesUsed });
+    }
+
+    // POST /vectorize-pending
+    if (url.pathname === "/vectorize-pending" && request.method === "POST") {
+      const authErr = requireAuth(request, env);
+      if (authErr) return authErr;
+
+      const graceCutoff = Date.now() - graceMs(env);
+
+      const { results: toProcess } = await env.DB.prepare(
+        `SELECT id, content, tags, source, created_at FROM entries
+         WHERE vector_ids = '[]' AND created_at < ?
+         ORDER BY created_at DESC LIMIT 25`
+      ).bind(graceCutoff).all();
+
+      let processed = 0;
+      let failed = 0;
+
+      for (const row of toProcess as Record<string, any>[]) {
+        try {
+          await storeEntry(
+            env,
+            row.id as string,
+            row.content as string,
+            JSON.parse(row.tags as string),
+            row.source as string,
+            row.created_at as number
+          );
+          processed++;
+        } catch (e) {
+          console.error("Re-embed failed for entry", row.id, e);
+          failed++;
+        }
+      }
+
+      const remaining = await env.DB.prepare(
+        `SELECT COUNT(*) as count FROM entries WHERE vector_ids = '[]' AND created_at < ?`
+      ).bind(graceCutoff).first() as Record<string, any> | null;
+
+      return json({ processed, failed, remaining: (remaining?.count as number) ?? 0 });
     }
 
     return new Response("Not found", { status: 404 });

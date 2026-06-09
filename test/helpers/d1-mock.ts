@@ -88,7 +88,16 @@ export class D1Mock {
           const avg_importance = scored.length > 0
             ? scored.reduce((sum: number, e: any) => sum + e.importance_score, 0) / scored.length
             : null;
-          return { count, avg_importance };
+          const cutoff = args.length > 0 ? Number(args[0]) : undefined;
+          const unvectorized = cutoff !== undefined
+            ? db.entries.filter((e: any) => e.vector_ids === '[]' && e.created_at < cutoff).length
+            : 0;
+          return { count, avg_importance, unvectorized };
+        }
+        if (s.includes("COUNT(*) as count") && s.includes("vector_ids = '[]'") && s.includes("created_at <")) {
+          const cutoff = Number(args[0]);
+          const count = db.entries.filter((e: any) => e.vector_ids === '[]' && e.created_at < cutoff).length;
+          return { count };
         }
         if (s.includes("COUNT(*) as count")) {
           return { count: db.entries.length };
@@ -193,6 +202,17 @@ export class D1Mock {
             (JSON.parse(e.tags ?? "[]") as string[]).forEach(t => tags.add(t));
           });
           return { results: [...tags].sort().map(t => ({ value: t })) };
+        }
+        if (s.includes("vector_ids = '[]' AND created_at <") && s.includes("ORDER BY created_at DESC LIMIT")) {
+          const cutoff = Number(args[0]);
+          const limitMatch = s.match(/LIMIT\s+(\d+)/i);
+          const limit = limitMatch ? parseInt(limitMatch[1], 10) : 25;
+          const rows = [...db.entries]
+            .filter((e: any) => e.vector_ids === '[]' && e.created_at < cutoff)
+            .sort((a: any, b: any) => b.created_at - a.created_at)
+            .slice(0, limit)
+            .map((e: any) => ({ id: e.id, content: e.content, tags: e.tags, source: e.source, created_at: e.created_at }));
+          return { results: rows };
         }
         if (s.includes("ORDER BY created_at DESC LIMIT")) {
           const limit = Number(args[args.length - 1]);
