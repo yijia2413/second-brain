@@ -42,6 +42,24 @@ const TAG_BOOST_MAX = 1.5;
 // log1p(|net|) * this step, clamped to the [1,5] importance band. Tunable.
 const CONTRADICTION_IMPORTANCE_STEP = 1.0;
 
+// ─── Compression eligibility ──────────────────────────────────────────────────
+// An entry is eligible for nightly digest compression only if it's low-importance,
+// not proven-useful by recall, and not a contradiction survivor. Strictly more
+// protective than the old `importance_score < 4` filter — it can only exempt MORE.
+export const COMPRESSION_IMPORTANCE_THRESHOLD = 4;   // importance >= this → protected
+export const COMPRESSION_MIN_RECALL = 2;             // recalled >= this many times → protected
+export const COMPRESSION_MIN_AGE_MS = 60 * 86400000; // entries with fewer than COMPRESSION_MIN_RECALL recalls protected until this old (60 days)
+
+// Returns a SQL boolean fragment for "this entry is eligible for compression".
+// Contains exactly one `?` placeholder — bind `Date.now() - COMPRESSION_MIN_AGE_MS`.
+// columnPrefix: "" for bare columns (compressTag), "entries." for json_each-joined queries.
+export function compressionEligibilitySql(columnPrefix = ""): string {
+  const p = columnPrefix;
+  return `(${p}importance_score IS NULL OR ${p}importance_score < ${COMPRESSION_IMPORTANCE_THRESHOLD})
+      AND (${p}recall_count = 0 OR (${p}recall_count < ${COMPRESSION_MIN_RECALL} AND ${p}created_at < ?))
+      AND (${p}contradiction_wins IS NULL OR ${p}contradiction_wins = 0)`;
+}
+
 // ─── Model constants ──────────────────────────────────────────────────────────
 
 const EMBEDDING_MODEL = "@cf/baai/bge-small-en-v1.5";
@@ -963,6 +981,14 @@ export async function compressTag(
   env: Env,
   ctx: ExecutionContext
 ): Promise<{ synthesizedId: string | null; entriesUsed: number; text: string }> {
+  // Reserved/namespaced tags (kind:*, status:*) describe a memory's type/lifecycle,
+  // not a topic — digesting them would blend unrelated memories (and could compress
+  // protected/canonical ones). Never compress by them. This also guards /digest and
+  // the web UI Compress button, not just the nightly cron.
+  if (tag.startsWith(STATUS_PREFIX) || tag.startsWith(KIND_PREFIX)) {
+    return { synthesizedId: null, entriesUsed: 0, text: "" };
+  }
+
   const recentSynth = await env.DB.prepare(`
     SELECT id FROM entries
     WHERE tags LIKE '%"synthesized"%'
@@ -982,10 +1008,10 @@ export async function compressTag(
       AND tags NOT LIKE '%"synthesized"%'
       AND tags NOT LIKE '%"auto-pattern"%'
       AND tags NOT LIKE '%"rolled-up"%'
-      AND (importance_score IS NULL OR importance_score < 4)
+      AND ${compressionEligibilitySql()}
     ORDER BY created_at DESC
     LIMIT 50
-  `).bind(`%"${tag}"%`).all();
+  `).bind(`%"${tag}"%`, Date.now() - COMPRESSION_MIN_AGE_MS).all();
 
   if (rawEntries.length < 10) {
     return { synthesizedId: null, entriesUsed: 0, text: "" };
@@ -1022,14 +1048,16 @@ async function runNightlyCompression(env: Env, ctx: ExecutionContext): Promise<v
     SELECT value as tag, COUNT(*) as count
     FROM entries, json_each(entries.tags)
     WHERE value NOT IN ('synthesized', 'auto-pattern', 'duplicate-candidate', 'contradiction-resolved', 'rolled-up')
+      AND value NOT LIKE 'status:%'
+      AND value NOT LIKE 'kind:%'
       AND entries.tags NOT LIKE '%"rolled-up"%'
       AND entries.tags NOT LIKE '%"synthesized"%'
       AND entries.tags NOT LIKE '%"auto-pattern"%'
-      AND (entries.importance_score IS NULL OR entries.importance_score < 4)
+      AND ${compressionEligibilitySql("entries.")}
     GROUP BY value
     HAVING count > 10
     ORDER BY count DESC
-  `).all();
+  `).bind(Date.now() - COMPRESSION_MIN_AGE_MS).all();
 
   for (const row of results) {
     const tag = row.tag as string;
@@ -1916,15 +1944,17 @@ const defaultHandler = {
           SELECT value as tag, COUNT(*) as count
           FROM entries, json_each(entries.tags)
           WHERE value NOT IN ('synthesized', 'auto-pattern', 'duplicate-candidate', 'contradiction-resolved', 'rolled-up')
+            AND value NOT LIKE 'status:%'
+            AND value NOT LIKE 'kind:%'
             AND entries.tags NOT LIKE '%"rolled-up"%'
             AND entries.tags NOT LIKE '%"synthesized"%'
             AND entries.tags NOT LIKE '%"auto-pattern"%'
-            AND (entries.importance_score IS NULL OR entries.importance_score < 4)
+            AND ${compressionEligibilitySql("entries.")}
           GROUP BY value
           HAVING count > 10
           ORDER BY count DESC
           LIMIT 10
-        `).all(),
+        `).bind(Date.now() - COMPRESSION_MIN_AGE_MS).all(),
       ]);
 
       const cutoff = Date.now() - 86400000;
