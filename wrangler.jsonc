@@ -9,15 +9,13 @@
 	"d1_databases": [
 		{
 			"binding": "DB",
-			"database_name": "second-brain-db","database_id": "ce0cf094-89dd-4af8-99e6-19e5f27d2343"
+			"database_name": "second-brain-db"
 		}
 	],
 	"vectorize": [
 		{
 			"binding": "VECTORIZE",
-			"index_name": "second-brain-vectors",
-			"dimensions": "${VECTORIZE_DIMENSIONS}",
-			"metric": "${VECTORIZE_METRIC}"
+			"index_name": "second-brain-vectors"
 		}
 	],
 	"ai": {
@@ -25,7 +23,7 @@
 	},
 	"kv_namespaces": [
 		{
-			"binding": "OAUTH_KV","id": "1d2d129530c04edda7bab9aa9ce39d60"
+			"binding": "OAUTH_KV"
 		}
 	],
 	"vars": {
