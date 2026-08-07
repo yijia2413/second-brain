@@ -1,4 +1,46 @@
-import { COMPRESSION_IMPORTANCE_THRESHOLD, COMPRESSION_MIN_RECALL } from "../../src/index";
+import { COMPRESSION_IMPORTANCE_THRESHOLD, COMPRESSION_MIN_RECALL, isTopicTag } from "../../src/compression/eligibility";
+
+/**
+ * Decode a `%"tag"%` bind parameter back to the tag, undoing tagLikePattern's escaping.
+ *
+ * Production escapes % and _ in the tag and pairs the clause with ESCAPE '\\', so a tag
+ * `q3_planning` arrives here as `%"q3\\_planning"%`. Without this the double would look for
+ * a tag spelled with a backslash and silently match nothing.
+ */
+const tagFromLikePattern = (pattern: string) =>
+  pattern.replace(/%"/g, "").replace(/"%/g, "").replace(/\\([%_\\])/g, "$1");
+
+/**
+ * Does this tag array satisfy `tags LIKE '%"<tag>"%'`?
+ *
+ * MODELS: ASCII case-insensitivity. SQLite's LIKE matches `Work` for `%"work"%`, and
+ * comparing case-sensitively here would make the double disagree with production on exactly
+ * the inputs behind #278's rollup bug, where the candidate `Kind:Semantic` selected — and
+ * rolled up — every entry carrying `kind:semantic`. test/unit/d1-mock-fidelity.test.ts pins
+ * this; do not "simplify" it back to Array.includes.
+ *
+ * DOES NOT MODEL, so a green test here is NOT coverage of any of these:
+ *   - LIKE wildcards in the tag. Real `%"q3_planning"%` also matches `q3-planning`, and
+ *     `%"%"%` matches every row; this matches exactly one tag either way. That is why P1's
+ *     escaping bug is covered against real SQLite in test/integration/, not here.
+ *   - JSON escaping. A tag containing a quote is stored as \\" so real LIKE misses it;
+ *     this compares the decoded strings and matches.
+ *   - Unicode case folding. SQLite's LIKE is ASCII-only; toLowerCase is not, so this
+ *     matches `Σ`/`σ` where real LIKE does not.
+ * Anything whose subject is the pattern rather than the tag belongs in a real-SQLite test.
+ */
+const tagMatchesLike = (tags: string[], tag: string) =>
+  tags.some(t => t.toLowerCase() === tag.toLowerCase());
+
+/** What src/db/init.ts's probe sees on a migrated brain — see the handler in all(). */
+const SCHEMA_PROBE_RESULTS = [
+  ...["entries", "edges"].map(name => ({ kind: "table", name })),
+  ...["idx_entries_created_at", "idx_entries_source", "idx_edges_source", "idx_edges_target",
+    "idx_edges_weight"].map(name => ({ kind: "index", name })),
+  ...["id", "content", "tags", "source", "created_at", "vector_ids", "recall_count",
+    "importance_score", "contradiction_wins", "contradiction_losses", "updated_at",
+    "staleness_checked_at"].map(name => ({ kind: "column", name })),
+];
 
 export class D1Mock {
   entries: any[] = [];
@@ -6,16 +48,34 @@ export class D1Mock {
 
   prepare(sql: string) {
     const s = sql.replace(/\s+/g, " ").trim();
+    // Production pairs every tag LIKE clause with `ESCAPE '\\'` (see tagLikePattern). The
+    // escape clause never changes which query a statement IS, so branches that identify a
+    // query by its exact text compare against this form rather than each growing a suffix.
+    const sBare = s.replace(/ ESCAPE '\\'/g, "");
     const db = this;
 
     const makeStmt = (args: any[]) => ({
       async run() {
         if (s.startsWith("INSERT INTO entries")) {
-          const [id, content, tags, source, created_at, vector_ids] = args;
-          db.entries.push({ id, content, tags, source, created_at, vector_ids, recall_count: 0, importance_score: 0, contradiction_wins: 0, contradiction_losses: 0 });
+          if (args.length >= 8) {
+            const [id, content, tags, source, created_at, updated_at, vector_ids, importance_score] = args;
+            db.entries.push({ id, content, tags, source, created_at, updated_at, vector_ids, recall_count: 0, importance_score: importance_score ?? 0, contradiction_wins: 0, contradiction_losses: 0 });
+          } else if (args.length === 7) {
+            const [id, content, tags, source, created_at, updated_at, vector_ids] = args;
+            db.entries.push({ id, content, tags, source, created_at, updated_at, vector_ids, recall_count: 0, importance_score: 0, contradiction_wins: 0, contradiction_losses: 0 });
+          } else {
+            const [id, content, tags, source, created_at, vector_ids] = args;
+            db.entries.push({ id, content, tags, source, created_at, updated_at: created_at, vector_ids, recall_count: 0, importance_score: 0, contradiction_wins: 0, contradiction_losses: 0 });
+          }
           return { meta: { changes: 1 } };
         }
-        if (s.startsWith("UPDATE entries SET content = ?, vector_ids")) {
+        if (s.startsWith("UPDATE entries SET content = ?, vector_ids = ?, tags = ?, updated_at = ? WHERE id")) {
+          const [content, vector_ids, tags, updated_at, id] = args;
+          const row = db.entries.find((e: any) => e.id === id);
+          if (row) { row.content = content; row.vector_ids = vector_ids; row.tags = tags; row.updated_at = updated_at; }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("UPDATE entries SET content = ?, vector_ids = ? WHERE id")) {
           const [content, vector_ids, id] = args;
           const row = db.entries.find((e: any) => e.id === id);
           if (row) { row.content = content; row.vector_ids = vector_ids; }
@@ -33,10 +93,49 @@ export class D1Mock {
           if (row) row.vector_ids = vector_ids;
           return { meta: { changes: row ? 1 : 0 } };
         }
+        if (s.startsWith("UPDATE entries SET tags = ? WHERE id = ? AND tags = ?")) {
+          const [tags, id, expectedTags] = args;
+          const row = db.entries.find((e: any) => e.id === id);
+          if (row && row.tags === expectedTags) {
+            row.tags = tags;
+            return { meta: { changes: 1 } };
+          }
+          return { meta: { changes: 0 } };
+        }
+        if (s.startsWith("UPDATE entries SET tags = ?, staleness_checked_at = ? WHERE id = ? AND tags = ? AND content = ?")) {
+          // Staleness CAS: guards content as well as tags, because the verdict being
+          // written is derived from content and the tag mutation is often a no-op.
+          const [tags, staleness_checked_at, id, expectedTags, expectedContent] = args;
+          const row = db.entries.find((e: any) => e.id === id);
+          if (row && row.tags === expectedTags && row.content === expectedContent) {
+            row.tags = tags;
+            row.staleness_checked_at = staleness_checked_at;
+            return { meta: { changes: 1 } };
+          }
+          return { meta: { changes: 0 } };
+        }
+        if (s.startsWith("UPDATE entries SET staleness_checked_at = ? WHERE id = ?")) {
+          const [staleness_checked_at, id] = args;
+          const row = db.entries.find((e: any) => e.id === id);
+          if (row) row.staleness_checked_at = staleness_checked_at;
+          return { meta: { changes: row ? 1 : 0 } };
+        }
         if (s.startsWith("UPDATE entries SET tags = ? WHERE id")) {
           const [tags, id] = args;
           const row = db.entries.find((e: any) => e.id === id);
           if (row) row.tags = tags;
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("UPDATE entries SET content = ?, tags = ?, updated_at = ? WHERE id")) {
+          const [content, tags, updated_at, id] = args;
+          const row = db.entries.find((e: any) => e.id === id);
+          if (row) { row.content = content; row.tags = tags; row.updated_at = updated_at; }
+          return { meta: { changes: row ? 1 : 0 } };
+        }
+        if (s.startsWith("UPDATE entries SET content = ?, updated_at = ? WHERE id")) {
+          const [content, updated_at, id] = args;
+          const row = db.entries.find((e: any) => e.id === id);
+          if (row) { row.content = content; row.updated_at = updated_at; }
           return { meta: { changes: row ? 1 : 0 } };
         }
         if (s.startsWith("UPDATE entries SET content = ?, tags")) {
@@ -45,7 +144,7 @@ export class D1Mock {
           if (row) { row.content = content; row.tags = tags; }
           return { meta: { changes: row ? 1 : 0 } };
         }
-        if (s.startsWith("UPDATE entries SET content")) {
+        if (s.startsWith("UPDATE entries SET content = ? WHERE id")) {
           const [content, id] = args;
           const row = db.entries.find((e: any) => e.id === id);
           if (row) row.content = content;
@@ -146,6 +245,11 @@ export class D1Mock {
           const row = db.entries.find((e: any) => e.id === args[0]);
           return row ? { vector_ids: row.vector_ids } : null;
         }
+        // These branches match `as count` in lower case only. src/migration/embedding.ts
+        // writes `AS count`, so three of its queries fall through here and return null
+        // rather than a row — pre-existing, and those paths are covered against real SQLite
+        // in test/integration/embedding-migration.test.ts. Worth knowing before adding a
+        // fourth caller and trusting the double.
         if (s.includes("COUNT(*) as count") && s.includes("AVG(importance_score)")) {
           const count = db.entries.length;
           const scored = db.entries.filter((e: any) => typeof e.importance_score === "number");
@@ -185,8 +289,8 @@ export class D1Mock {
             const tags: string[] = JSON.parse(e.tags ?? "[]");
             if (!hardcoded.every(t => tags.includes(t))) return false;
             return likePatterns.every((p: string) => {
-              const tag = p.replace(/%"/g, "").replace(/"%/g, "");
-              return tags.includes(tag);
+              const tag = tagFromLikePattern(p);
+              return tagMatchesLike(tags, tag);
             });
           });
           return match ? { id: match.id } : null;
@@ -194,15 +298,26 @@ export class D1Mock {
         return null;
       },
       async all() {
+        if (s.startsWith("SELECT type AS kind, name FROM sqlite_master")) {
+          // src/db/init.ts's schema probe. This mock stands in for a deployed brain, and
+          // a deployed brain is migrated — its rows carry every ALTER column below — so
+          // the honest answer is "all present", which is also what makes the mock report
+          // the real cold-start cost of a cold isolate rather than a fresh install's.
+          // The names are spelled out rather than imported from init.ts on purpose: a
+          // mock that derives its answer from the code under test can only ever agree
+          // with it. Fresh and partially-migrated brains are covered against real SQLite
+          // in test/unit/db-init.test.ts.
+          return { results: SCHEMA_PROBE_RESULTS };
+        }
         if (
-          s === "SELECT id FROM entries WHERE tags LIKE ?" ||
-          s === "SELECT id, vector_ids FROM entries WHERE tags LIKE ?" ||
-          s === "SELECT id, vector_ids, content, tags, source, created_at FROM entries WHERE tags LIKE ?"
+          sBare === "SELECT id FROM entries WHERE tags LIKE ?" ||
+          sBare === "SELECT id, vector_ids FROM entries WHERE tags LIKE ?" ||
+          sBare === "SELECT id, vector_ids, content, tags, source, created_at FROM entries WHERE tags LIKE ?"
         ) {
           const pattern = String(args[0]);
-          const tag = pattern.replace(/%"/g, "").replace(/"%/g, "");
+          const tag = tagFromLikePattern(pattern);
           const results = db.entries
-            .filter((e: any) => (JSON.parse(e.tags ?? "[]") as string[]).includes(tag))
+            .filter((e: any) => tagMatchesLike(JSON.parse(e.tags ?? "[]"), tag))
             .map((e: any) => ({ id: e.id, vector_ids: e.vector_ids ?? "[]", content: e.content, tags: e.tags, source: e.source, created_at: e.created_at }));
           return { results };
         }
@@ -240,7 +355,7 @@ export class D1Mock {
           const results = db.edges
             .filter((e: any) => ids.has(e.source_id) || ids.has(e.target_id))
             .sort((a: any, b: any) => b.weight - a.weight)
-            .map((e: any) => ({ source_id: e.source_id, target_id: e.target_id, type: e.type, weight: e.weight }));
+            .map((e: any) => ({ source_id: e.source_id, target_id: e.target_id, type: e.type, weight: e.weight, provenance: e.provenance, created_at: e.created_at }));
           return { results };
         }
         if (s.includes("SELECT source_id, target_id FROM edges ORDER BY weight DESC")) {
@@ -279,7 +394,78 @@ export class D1Mock {
         if (s.includes("SELECT id, recall_count, importance_score") && s.includes("WHERE id IN")) {
           const results = db.entries
             .filter((e: any) => args.includes(e.id))
-            .map((e: any) => ({ id: e.id, recall_count: e.recall_count ?? 0, importance_score: e.importance_score ?? 0, contradiction_wins: e.contradiction_wins ?? 0, contradiction_losses: e.contradiction_losses ?? 0 }));
+            .map((e: any) => ({
+              id: e.id,
+              recall_count: e.recall_count ?? 0,
+              importance_score: e.importance_score ?? 0,
+              contradiction_wins: e.contradiction_wins ?? 0,
+              contradiction_losses: e.contradiction_losses ?? 0,
+              tags: e.tags ?? "[]",
+            }));
+          return { results };
+        }
+        if (s.includes("SELECT tags FROM entries WHERE id = ?")) {
+          const row = db.entries.find((e: any) => e.id === args[0]);
+          return { results: row ? [{ tags: row.tags }] : [] };
+        }
+        if (s.startsWith("SELECT id, tags, content FROM entries WHERE id IN")) {
+          // Staleness retry re-read: fresh tags and content for every row whose CAS lost,
+          // in one statement. Rows deleted mid-pass simply do not come back.
+          const results = db.entries
+            .filter((e: any) => args.includes(e.id))
+            .map((e: any) => ({ id: e.id, tags: e.tags, content: e.content }));
+          return { results };
+        }
+        if (s.includes("COALESCE(updated_at, created_at) < ?") && s.includes("SELECT id, content, tags FROM entries")) {
+          const cutoff = Number(args[0]);
+          const limitMatch = s.match(/LIMIT (\d+)/);
+          const limit = limitMatch ? parseInt(limitMatch[1], 10) : 25;
+          const results = [...db.entries]
+            .filter((e: any) => {
+              const tags: string[] = JSON.parse(e.tags ?? "[]");
+              if (tags.includes("status:deprecated")) return false;
+              if (tags.includes("auto-pattern")) return false;
+              if (tags.includes("synthesized")) return false;
+              if (tags.includes("rolled-up")) return false;
+              const touched = e.updated_at ?? e.created_at;
+              return touched < cutoff;
+            })
+            .sort((a: any, b: any) => (a.staleness_checked_at ?? 0) - (b.staleness_checked_at ?? 0))
+            .slice(0, limit)
+            .map((e: any) => ({ id: e.id, content: e.content, tags: e.tags }));
+          return { results };
+        }
+        if (s.includes("SELECT id, content, tags, source, created_at, updated_at FROM entries WHERE id IN")) {
+          const inMatch = s.match(/WHERE id IN \(([^)]*)\)/);
+          const idCount = inMatch ? inMatch[1].split(",").length : 0;
+          const ids = args.slice(0, idCount);
+          const rest = args.slice(idCount);
+          let argIdx = 0;
+          const kindMatch = s.match(/tags LIKE '%"(kind:(?:episodic|semantic))"%'/);
+          let rows = db.entries.filter((e: any) => {
+            const tags: string[] = JSON.parse(e.tags ?? "[]");
+            if (!ids.includes(e.id)) return false;
+            if (tags.includes("auto-pattern")) return false;
+            if (s.includes('"status:deprecated"') && tags.includes("status:deprecated")) return false;
+            if (kindMatch && !tags.includes(kindMatch[1])) return false;
+            return true;
+          });
+          if (s.includes("created_at >= ?")) {
+            const after = Number(rest[argIdx++]);
+            rows = rows.filter((e: any) => e.created_at >= after);
+          }
+          if (s.includes("created_at <= ?")) {
+            const before = Number(rest[argIdx++]);
+            rows = rows.filter((e: any) => e.created_at <= before);
+          }
+          const results = rows.map((e: any) => ({
+            id: e.id,
+            content: e.content,
+            tags: e.tags,
+            source: e.source,
+            created_at: e.created_at,
+            updated_at: e.updated_at ?? e.created_at,
+          }));
           return { results };
         }
         if (s.includes("FROM entries WHERE id IN") && s.includes("tags NOT LIKE")) {
@@ -313,12 +499,12 @@ export class D1Mock {
           // compressTag raw entries query — tag match, system-tag exclusion, and the
           // recall/age/contradiction eligibility predicate (cutoff is the 2nd bind param).
           const tagPattern = args[0] as string;
-          const tag = tagPattern.replace(/%"/g, "").replace(/"%/g, "");
+          const tag = tagFromLikePattern(tagPattern);
           const cutoff = Number(args[1]);
           const results = [...db.entries]
             .filter((e: any) => {
               const tags: string[] = JSON.parse(e.tags ?? "[]");
-              if (!tags.includes(tag)) return false;
+              if (!tagMatchesLike(tags, tag)) return false;
               if (tags.includes("synthesized") || tags.includes("auto-pattern") || tags.includes("rolled-up")) return false;
               if (!(e.importance_score == null || e.importance_score < COMPRESSION_IMPORTANCE_THRESHOLD)) return false;
               const rc = e.recall_count; // NULL/undefined → recall clause is falsy → protected (matches SQL)
@@ -341,7 +527,6 @@ export class D1Mock {
           // Digest-candidate query (nightly compression + /stats): per-tag count of
           // entries that pass the compression eligibility predicate. Cutoff is args[0].
           const cutoff = Number(args[0]);
-          const SYSTEM = ["synthesized", "auto-pattern", "duplicate-candidate", "contradiction-resolved", "rolled-up"];
           const counts = new Map<string, number>();
           for (const e of db.entries as any[]) {
             const tags: string[] = JSON.parse(e.tags ?? "[]");
@@ -351,8 +536,10 @@ export class D1Mock {
             if (!(rc === 0 || (rc < COMPRESSION_MIN_RECALL && e.created_at < cutoff))) continue;
             if (!(e.contradiction_wins == null || e.contradiction_wins === 0)) continue;
             for (const t of tags) {
-              if (SYSTEM.includes(t)) continue;
-              if (t.startsWith("status:") || t.startsWith("kind:")) continue;
+              // The same predicate isTopicTagSql() is generated from, rather than a second
+              // copy of the rule: a double that filters differently from production hides
+              // exactly the bugs it is supposed to catch.
+              if (!isTopicTag(t)) continue;
               counts.set(t, (counts.get(t) ?? 0) + 1);
             }
           }
@@ -426,8 +613,8 @@ export class D1Mock {
           let rows = [...db.entries];
           if (s.includes("tags LIKE ?")) {
             const pattern = String(filterArgs[argIdx++]);
-            const tag = pattern.replace(/%"/g, "").replace(/"%/g, "");
-            rows = rows.filter((e: any) => (JSON.parse(e.tags ?? "[]") as string[]).includes(tag));
+            const tag = tagFromLikePattern(pattern);
+            rows = rows.filter((e: any) => tagMatchesLike(JSON.parse(e.tags ?? "[]"), tag));
           }
           if (s.includes("created_at >= ?")) {
             const after = Number(filterArgs[argIdx++]);
