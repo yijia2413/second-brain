@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   parseAndExpand,
   buildEventContent,
+  stripConferencingBlock,
   computeCalendarPlan,
   computeRetentionPrune,
   validateCalendarUrl,
@@ -194,6 +195,28 @@ describe("parseAndExpand", () => {
       isRecurring: false,
       summary: "Orphan Instance",
     });
+  });
+
+  // Proves the stripper is wired into the parse path, not merely exported and
+  // unit-tested. Without this a neutered call site keeps every unit test green.
+  it("strips the conferencing block from a parsed event description", () => {
+    const ics = calendar(
+      vevent([
+        "UID:conf-1@test",
+        "DTSTAMP:20260101T000000Z",
+        "DTSTART:20260710T140000Z",
+        "DTEND:20260710T150000Z",
+        "SUMMARY:Roadmap Review",
+        "DESCRIPTION:Agenda: pricing then Q3.\\n\\nJoin Zoom Meeting\\nhttps://example.zoom.us/j/1\\nMeeting ID: 123 456 7890\\nPasscode: 999999",
+      ]),
+    );
+
+    const occs = parseAndExpand(ics, ms("2026-07-01T00:00:00Z"), ms("2026-07-31T00:00:00Z"));
+
+    expect(occs).toHaveLength(1);
+    expect(occs[0].description).toBe("Agenda: pricing then Q3.");
+    expect(occs[0].description).not.toContain("Zoom");
+    expect(occs[0].description).not.toContain("Passcode");
   });
 
   it("does not return an event entirely outside the window", () => {
@@ -466,6 +489,72 @@ describe("computeRetentionPrune", () => {
   });
 });
 
+// The calendar twin of the email trailer problem. A conferencing block is
+// templated, so it repeats on every event from every organiser, and a recurring
+// meeting repeats it on every occurrence — the same text embedded dozens of
+// times. It is also pure navigation: dial-in numbers and a join URL say nothing
+// about what the meeting is for.
+describe("stripConferencingBlock", () => {
+  it("drops a Zoom join block and keeps the agenda", () => {
+    const description = [
+      "Agenda: pricing review, then Q3 planning.",
+      "",
+      "Join Zoom Meeting",
+      "https://example.zoom.us/j/1234567890?pwd=abc",
+      "",
+      "Meeting ID: 123 456 7890",
+      "Passcode: 123456",
+      "",
+      "One tap mobile",
+      "+13120000000,,1234567890# US (Chicago)",
+      "",
+      "Dial by your location",
+      "+1 312 000 0000 US (Chicago)",
+      "Find your local number: https://example.zoom.us/u/abc",
+    ].join("\n");
+
+    expect(stripConferencingBlock(description)).toBe("Agenda: pricing review, then Q3 planning.");
+  });
+
+  it("drops a Teams join block", () => {
+    const description = [
+      "Weekly sync. Bring the migration numbers.",
+      "________________________________________________________________________________",
+      "Microsoft Teams meeting",
+      "Join on your computer, mobile app or room device",
+      "Click here to join the meeting",
+      "Meeting ID: 123 456 789 012",
+      "Passcode: abc123",
+      "Learn more | Meeting options",
+      "________________________________________________________________________________",
+    ].join("\n");
+
+    expect(stripConferencingBlock(description)).toBe("Weekly sync. Bring the migration numbers.");
+  });
+
+  it("drops a Google Meet join block", () => {
+    const description = [
+      "Design review for the new onboarding flow.",
+      "",
+      "Join with Google Meet: https://meet.example.com/abc-defg-hij",
+      "Or dial: (US) +1 234 000 0000 PIN: 123456789#",
+      "More phone numbers: https://tel.example.com/abc-defg-hij",
+    ].join("\n");
+
+    expect(stripConferencingBlock(description)).toBe("Design review for the new onboarding flow.");
+  });
+
+  it("keeps a description with no conferencing block", () => {
+    const description = "Bring the Q3 numbers and last month's churn breakdown.";
+    expect(stripConferencingBlock(description)).toBe(description);
+  });
+
+  it("keeps a description that merely mentions a meeting", () => {
+    const description = "We should join the pricing meeting before deciding.";
+    expect(stripConferencingBlock(description)).toBe(description);
+  });
+});
+
 describe("buildEventContent", () => {
   function occ(overrides: Partial<Occurrence>): Occurrence {
     return {
@@ -524,11 +613,25 @@ describe("validateCalendarUrl", () => {
     vi.unstubAllGlobals();
   });
 
-  function stubFetch(impl: (url: string) => { ok: boolean; status: number; text: () => Promise<string> }) {
-    const fn = vi.fn().mockImplementation(async (url: string) => impl(url));
+  function stubFetch(
+    impl: (
+      url: string,
+      init?: RequestInit,
+    ) => { ok: boolean; status: number; text: () => Promise<string> },
+  ) {
+    const fn = vi.fn().mockImplementation(async (url: string, init?: RequestInit) => impl(url, init));
     vi.stubGlobal("fetch", fn);
     return fn;
   }
+
+  const icsHeaders = expect.objectContaining({
+    method: "GET",
+    redirect: "follow",
+    headers: expect.objectContaining({
+      Accept: "text/calendar, text/plain, */*",
+      "User-Agent": "CalendarAgent/1.0 SecondBrain/2",
+    }),
+  });
 
   it("normalizes webcal:// to https:// and resolves the X-WR-CALNAME as the label", async () => {
     const fetchMock = stubFetch(() => ({
@@ -541,10 +644,80 @@ describe("validateCalendarUrl", () => {
     }));
     const label = await validateCalendarUrl("webcal://example.com/cal.ics");
     expect(label).toBe("My Cal");
+    expect(fetchMock).toHaveBeenCalledWith("https://example.com/cal.ics", icsHeaders);
+    // Never probe with HEAD — Apple's published calendars return 400 to HEAD.
+    for (const [, init] of fetchMock.mock.calls) {
+      expect(init?.method).not.toBe("HEAD");
+    }
+  });
+
+  it("accepts an iCloud published URL without a .ics extension (GET-only + UA)", async () => {
+    const fetchMock = stubFetch(() => ({
+      ok: true,
+      status: 200,
+      text: async () =>
+        [
+          "BEGIN:VCALENDAR",
+          "VERSION:2.0",
+          "PRODID:-//caldav.icloud.com//CALDAVJ//EN",
+          "X-WR-CALNAME:Family",
+          "END:VCALENDAR",
+        ].join("\r\n"),
+    }));
+    const label = await validateCalendarUrl("webcal://p12-caldav.icloud.com/published/2/token");
+    expect(label).toBe("Family");
     expect(fetchMock).toHaveBeenCalledWith(
-      "https://example.com/cal.ics",
-      expect.objectContaining({ headers: { Accept: "text/calendar" } }),
+      "https://p12-caldav.icloud.com/published/2/token",
+      icsHeaders,
     );
+  });
+
+  it("retries pNN-caldav.icloud.com on pNN-calendars.icloud.com when the first body is not ICS", async () => {
+    const fetchMock = stubFetch((url) => {
+      if (url.includes("-caldav.")) {
+        return { ok: false, status: 400, text: async () => "" };
+      }
+      return {
+        ok: true,
+        status: 200,
+        text: async () =>
+          ["BEGIN:VCALENDAR", "VERSION:2.0", "X-WR-CALNAME:Retried Cal", "END:VCALENDAR"].join("\r\n"),
+      };
+    });
+    const label = await validateCalendarUrl("https://p55-caldav.icloud.com/published/2/abc");
+    expect(label).toBe("Retried Cal");
+    expect(fetchMock.mock.calls.map((c) => c[0])).toEqual([
+      "https://p55-caldav.icloud.com/published/2/abc",
+      "https://p55-calendars.icloud.com/published/2/abc",
+    ]);
+  });
+
+  it("retries when caldav returns 200 HTML and calendars returns ICS", async () => {
+    stubFetch((url) => {
+      if (url.includes("-caldav.")) {
+        return { ok: true, status: 200, text: async () => "<html>nope</html>" };
+      }
+      return {
+        ok: true,
+        status: 200,
+        text: async () =>
+          ["BEGIN:VCALENDAR", "VERSION:2.0", "X-WR-CALNAME:From Calendars Host", "END:VCALENDAR"].join("\r\n"),
+      };
+    });
+    await expect(validateCalendarUrl("https://p7-caldav.icloud.com/published/2/tok")).resolves.toBe(
+      "From Calendars Host",
+    );
+  });
+
+  it("strips a leading UTF-8 BOM before validating", async () => {
+    stubFetch(() => ({
+      ok: true,
+      status: 200,
+      text: async () =>
+        "\uFEFF" +
+        ["BEGIN:VCALENDAR", "VERSION:2.0", "X-WR-CALNAME:BOM Cal", "END:VCALENDAR"].join("\r\n"),
+    }));
+    await expect(validateCalendarUrl("https://example.com/cal.ics")).resolves.toBe("BOM Cal");
   });
 
   it("falls back to the URL host when there is no X-WR-CALNAME", async () => {
@@ -569,6 +742,76 @@ describe("validateCalendarUrl", () => {
     await expect(validateCalendarUrl("https://example.com/page.html")).rejects.toThrow(
       /didn't return a calendar/,
     );
+  });
+
+  it("uses a distinct error when BEGIN:VCALENDAR is present but still unparseable after sanitization", async () => {
+    // Truncated mid-component: looks like ICS but cannot form a closed VCALENDAR.
+    stubFetch(() => ({
+      ok: true,
+      status: 200,
+      text: async () => ["BEGIN:VCALENDAR", "VERSION:2.0", "BEGIN:VEVENT", "SUMMARY:Broken"].join("\r\n"),
+    }));
+    await expect(validateCalendarUrl("https://example.com/broken.ics")).rejects.toThrow(
+      /couldn't be parsed/i,
+    );
+  });
+});
+
+describe("parseAndExpand Apple ICS quirks", () => {
+  it("still emits the event when X-APPLE-STRUCTURED-LOCATION has a non-indented continuation", () => {
+    // Real-world Apple bug: address continuation lacks a leading space, which
+    // makes strict parsers throw "invalid line (no token ; or :)" and sink the
+    // whole feed. Second Brain must strip/ignore that property and keep the event.
+    const ics = [
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//caldav.icloud.com//CALDAVJ//EN",
+      "BEGIN:VEVENT",
+      "UID:apple-loc@test",
+      "DTSTAMP:20260101T000000Z",
+      "DTSTART:20260710T140000Z",
+      "DTEND:20260710T150000Z",
+      "SUMMARY:Office Dinner",
+      'X-APPLE-STRUCTURED-LOCATION;VALUE=URI;X-ADDRESS="123 Main Street',
+      "Seattle WA 98101",
+      '";X-TITLE=123 Main Street:geo:47.6,-122.3',
+      "END:VEVENT",
+      "END:VCALENDAR",
+    ].join("\r\n");
+
+    const occs = parseAndExpand(ics, ms("2026-07-01T00:00:00Z"), ms("2026-07-31T00:00:00Z"));
+    expect(occs).toHaveLength(1);
+    expect(occs[0]).toMatchObject({
+      uid: "apple-loc@test",
+      summary: "Office Dinner",
+    });
+  });
+
+  it("still emits the event when a bare orphan line is not attached to X-APPLE-STRUCTURED-LOCATION", () => {
+    // ical.js throws "invalid line (no token ; or :)" on a content line with
+    // neither delimiter. stripAppleStructuredLocation does not touch this
+    // feed, so only dropOrphanIcsLines can recover it.
+    const ics = [
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//caldav.icloud.com//CALDAVJ//EN",
+      "BEGIN:VEVENT",
+      "UID:orphan-bare@test",
+      "DTSTAMP:20260101T000000Z",
+      "DTSTART:20260710T140000Z",
+      "DTEND:20260710T150000Z",
+      "SUMMARY:Team Sync",
+      "Seattle WA 98101",
+      "END:VEVENT",
+      "END:VCALENDAR",
+    ].join("\r\n");
+
+    const occs = parseAndExpand(ics, ms("2026-07-01T00:00:00Z"), ms("2026-07-31T00:00:00Z"));
+    expect(occs).toHaveLength(1);
+    expect(occs[0]).toMatchObject({
+      uid: "orphan-bare@test",
+      summary: "Team Sync",
+    });
   });
 });
 

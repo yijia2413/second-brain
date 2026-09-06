@@ -40,6 +40,7 @@
 import type { Env } from "../env";
 import { DEFAULTS, type Config } from "../config";
 import { storeEntry } from "../capture/store";
+import { INDEXABLE_SQL } from "../capture/lifecycle";
 import { chunkText } from "../text/chunk";
 import {
   MIGRATION_CHUNK_BUDGET,
@@ -57,9 +58,8 @@ export const MIGRATION_KEY = "migration:embedding";
  * Where the rebuild has got to.
  *
  * The cursor is `(created_at, id)` rather than an offset. Capture stays live
- * during a migration — the nightly cron writes, and recall itself writes via
- * `derivePattern` — so an offset would skip or repeat rows as the table grows
- * underneath it. A keyset cursor cannot.
+ * during a migration — the nightly cron writes — so an offset would skip or
+ * repeat rows as the table grows underneath it. A keyset cursor cannot.
  */
 export interface MigrationState {
   /** The model being migrated *to*, recorded so a resumed run can detect that
@@ -100,8 +100,12 @@ export interface BatchResult {
  * `deprecateEntry` and recall filters them out at hydration, so re-embedding
  * them would spend the scarce resource of the whole operation on rebuilding
  * something nothing reads.
+ *
+ * This was the only path that knew it. `/vectorize-pending` and the two
+ * "not searchable" counts did not, so a dismissed pattern was reported as
+ * broken and repaired back into the index.
  */
-const NOT_DEPRECATED = `tags NOT LIKE '%"status:deprecated"%'`;
+const NOT_DEPRECATED = INDEXABLE_SQL;
 
 export async function readMigration(env: Env): Promise<MigrationState | null> {
   try {
@@ -131,6 +135,7 @@ export async function estimate(
   env: Env,
 ): Promise<{ entries: number; chunks: number }> {
   const row = (await env.DB.prepare(
+    // scope-exempt: one-time re-embed migration: admin-triggered, deployment-wide, returns counts only
     `SELECT COUNT(*) AS entries,
             COALESCE(SUM(MAX(1, (LENGTH(content) + ${
               CHUNK_STRIDE - 1
@@ -164,7 +169,8 @@ function pageSql(hasCursor: boolean): string {
   const after = hasCursor
     ? `AND (created_at > ? OR (created_at = ? AND id > ?))`
     : "";
-  return `SELECT id, content, tags, source, created_at
+  // scope-exempt: one-time re-embed migration: admin-triggered and deployment-wide; the rows it selects go to the embedder, and only counts reach the response
+  return `SELECT id, content, tags, source, created_at, workspace_id, actor_id
             FROM entries
            WHERE ${NOT_DEPRECATED} ${after}
            ORDER BY created_at ASC, id ASC
@@ -178,7 +184,9 @@ async function countRemaining(
 ): Promise<number> {
   const sql =
     cursorCreatedAt === null
+      // scope-exempt: one-time re-embed migration: count only
       ? `SELECT COUNT(*) AS count FROM entries WHERE ${NOT_DEPRECATED}`
+      // scope-exempt: one-time re-embed migration: count only
       : `SELECT COUNT(*) AS count FROM entries WHERE ${NOT_DEPRECATED}
            AND (created_at > ? OR (created_at = ? AND id > ?))`;
   const stmt =
@@ -284,6 +292,9 @@ export async function runBatch(
     chunkBudget -= cost;
 
     try {
+      // Cron path, no request identity: the context comes from the row being
+      // repaired, not the caller, so a re-embed can never relocate an entry
+      // between workspaces.
       await storeEntry(
         env,
         row.id as string,
@@ -292,6 +303,7 @@ export async function runBatch(
         row.source as string,
         row.created_at as number,
         config,
+        { workspaceId: row.workspace_id as string, actorId: row.actor_id as string },
       );
       processed++;
       // Only advance past entries that actually succeeded. A failed entry stays

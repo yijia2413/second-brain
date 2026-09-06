@@ -25,6 +25,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import worker from "../../src/index";
 import { buildMcpServer } from "../../src/mcp/server";
+import { requireIdentity } from "../../src/lib/identity";
 import { initializeDatabase, resetDatabaseInit } from "../../src/db/init";
 import { makeAIMock, makeMemoryKV, makeVectorizeMock } from "../helpers/make-env";
 import { req } from "../helpers/make-request";
@@ -152,8 +153,12 @@ describe("POST /update and the MCP update tool write identical state (#289)", ()
    * the row the first one did rather than from what the first one left behind.
    */
   async function setUp(world: World) {
-    await d1.prepare(`DELETE FROM entries`).run();
     const { env, store, OAUTH_KV } = makeEnv(world);
+    // Provision tenancy BEFORE seeding so the seed lands in the owner's personal
+    // workspace exactly like any post-bootstrap write — otherwise the first caller
+    // in the file would get its row backfilled and later ones would not.
+    const owner = await ownerOf(env);
+    await d1.prepare(`DELETE FROM entries`).run();
     if (world.connectedIntegration) {
       await OAUTH_KV.put(
         `integrations:${world.connectedIntegration}`,
@@ -162,8 +167,8 @@ describe("POST /update and the MCP update tool write identical state (#289)", ()
     }
     const s = world.seed;
     await d1.prepare(
-      `INSERT INTO entries (id, content, tags, source, created_at, updated_at, vector_ids, recall_count, importance_score)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 0, 3)`,
+      `INSERT INTO entries (id, content, tags, source, created_at, updated_at, vector_ids, recall_count, importance_score, workspace_id, actor_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 0, 3, ?, ?)`,
     ).bind(
       ENTRY_ID,
       s.content,
@@ -172,6 +177,8 @@ describe("POST /update and the MCP update tool write identical state (#289)", ()
       s.createdAt ?? SEEDED_AT,
       s.updatedAt ?? null,
       JSON.stringify(s.vectorIds ?? [ENTRY_ID]),
+      owner.personalWorkspaceId,
+      owner.userId,
     ).run();
     return { env, store };
   }
@@ -194,10 +201,18 @@ describe("POST /update and the MCP update tool write identical state (#289)", ()
     return { snapshot: await capture(store), status: res.status, reply: body.message ?? body.error ?? "" };
   }
 
+  /** The owner identity, resolved exactly as the API handler does before building the server. */
+  async function ownerOf(env: Env) {
+    const request = req("POST", "/mcp");
+    const auth = await requireIdentity(request, env);
+    if (auth instanceof Response) throw new Error("owner failed to resolve");
+    return auth;
+  }
+
   /** The MCP `update` tool, through a real MCP client and transport. */
   async function viaMcp(world: World, content: string) {
     const { env, store } = await setUp(world);
-    const server = buildMcpServer(env, ctx);
+    const server = buildMcpServer(env, ctx, await ownerOf(env));
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     const client = new Client({ name: "parity-client", version: "1.0.0" });
     await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
@@ -269,17 +284,21 @@ describe("POST /update and the MCP update tool write identical state (#289)", ()
       expect: (s) => {
         // Spelled out because it is destructive and, for the MCP path, new: the private copy
         // stored content verbatim. extractHashtags collapses every whitespace run to one
-        // space and removes every #token unconditionally, so line breaks, list structure and
-        // code fences do not survive a replacement, and a bare issue reference becomes a tag.
-        // This is not a regression — captureEntry has always done it, so `remember` through
-        // this same transport produces a byte-identical row, and POST /update already did it.
-        // Divergence was the bug; this is what agreeing with the rest of the write path costs.
+        // space and removes named #tokens, so line breaks, list structure and code fences do
+        // not survive a replacement. This is not a regression — captureEntry has always done
+        // it, so `remember` through this same transport produces a byte-identical row, and
+        // POST /update already did it. Divergence was the bug; this is what agreeing with
+        // the rest of the write path costs.
+        //
+        // `#4821` stays in the content and does NOT become a tag: a bare number is an issue
+        // reference, and reading it as a tag produced rows carrying twenty numeric "tags"
+        // from synced PR bodies (src/text/hashtags.ts).
         //
         // `append` deliberately does NOT flatten: it embeds the addition verbatim after a
         // "[Update <date>]: " separator (src/capture/store.ts), so newlines survive there.
         // Reach for append, not update, when the text's shape matters.
-        expect(s.row!.content).toBe("Runbook: 1. drain 2. deploy ```sh npm run deploy ``` Ticket");
-        expect(tagsOf(s)).toEqual(["ops", "4821"]);
+        expect(s.row!.content).toBe("Runbook: 1. drain 2. deploy ```sh npm run deploy ``` Ticket #4821");
+        expect(tagsOf(s)).toEqual(["ops"]);
       },
     },
     {
@@ -403,7 +422,7 @@ describe("POST /update and the MCP update tool write identical state (#289)", ()
     const httpSnapshot = await capture(httpStore);
 
     const { env: mcpEnv, store: mcpStore } = await setUp(world);
-    const server = buildMcpServer(mcpEnv, ctx);
+    const server = buildMcpServer(mcpEnv, ctx, await ownerOf(mcpEnv));
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     const client = new Client({ name: "parity-client", version: "1.0.0" });
     await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);

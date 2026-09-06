@@ -6,6 +6,7 @@ import {
   FULL_MATCH_MAX_CHARS,
   RECALL_FULL_MATCHES,
   SNIPPET_MAX_CHARS,
+  queryRelevantWindow,
 } from "../../src/recall/snippet";
 
 // The cost of the truncation note itself, mirrored from snippet.ts. A memory
@@ -126,10 +127,46 @@ describe("allowanceFor", () => {
   });
 });
 
+describe("queryRelevantWindow", () => {
+  it("drops a partial leading word when a nonzero window starts inside it", () => {
+    const content = `${"x".repeat(100)} alpha beta ${"noise ".repeat(100)}`;
+    const window = queryRelevantWindow(content, ["alpha", "beta"]);
+
+    expect(window).toMatch(/^alpha beta /);
+    expect(window.length).toBeLessThanOrEqual(400);
+  });
+
+  // ── #326 ─────────────────────────────────────────────────────────────────────
+
+  it("selects a late full-width passage for an ASCII token and returns the stored text (criterion 5)", () => {
+    const content = "x".repeat(450) + " 設定は Ｃｌｏｕｄｆｌａｒｅ で管理する。" + "y".repeat(50);
+    const window = queryRelevantWindow(content, ["cloudflare"]);
+    expect(window).toContain("Ｃｌｏｕｄｆｌａｒｅ");
+    expect(window).not.toContain("Cloudflare");
+  });
+
+  it("lets a two-character CJK token select a window and keeps the passage in unspaced text", () => {
+    const content = "前".repeat(450) + "認証方式を変更した理由はここにある。" + "後".repeat(50);
+    const window = queryRelevantWindow(content, ["認証"]);
+    expect(window).toContain("認証方式を変更した理由");
+  });
+
+  it("still treats two-character ASCII tokens as noise", () => {
+    const content = "x".repeat(450) + " ok fine " + "y".repeat(50);
+    expect(queryRelevantWindow(content, ["ok"])).not.toContain("ok fine");
+  });
+
+  it("cuts on a CJK sentence end when no query term matches", () => {
+    const window = queryRelevantWindow("これは日本語の文章です。".repeat(40), ["zebra"]);
+    expect(window.endsWith("。")).toBe(true);
+    expect(window.length).toBeLessThanOrEqual(400);
+  });
+});
+
 describe("truncationNote", () => {
   it("carries the id and the full size so the caller can fetch the rest", () => {
     const note = truncationNote("abc-123", { text: "…", truncated: true, fullLength: 12345 });
     expect(note).toContain('get("abc-123")');
-    expect(note).toContain("12,345");
+    expect(note).toMatch(/12[,.]345/);
   });
 });

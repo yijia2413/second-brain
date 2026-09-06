@@ -30,6 +30,20 @@ describe("renderRecallText", () => {
     expect(out).toContain("Hello world");
   });
 
+  it("shows the author on company-layer rows", () => {
+    const out = renderRecallText([m({ workspace: "company", actorName: "Ada" })], "");
+    expect(out).toContain(" · shared · Ada");
+  });
+
+  it("leaves personal and system rows unbadged", () => {
+    // Every memory a caller can see is personal unless it was shared, so the badge
+    // carries no information there. It shipped unconditional, which put " · personal"
+    // on every line of every recall on a single-user brain — the majority of installs,
+    // where there is no other layer for it to be distinguished from.
+    expect(renderRecallText([m({ workspace: "personal" })], "")).not.toContain("· personal");
+    expect(renderRecallText([m({ workspace: "system" })], "")).not.toContain("· system");
+  });
+
   describe("graph-expanded (hop) provenance (#225)", () => {
     it("labels an auto-inferred hop 'auto-linked' and names the memory it came from", () => {
       const seed = m({ id: "seed", content: "Pricing decision for Q3", hop: 0 });
@@ -73,6 +87,27 @@ describe("renderRecallText", () => {
       const out = renderRecallText(many, "");
       expect(out).toMatch(/more matches omitted to bound the response size/);
       expect(out.length).toBeLessThan(20000);
+    });
+
+    it("keeps graph-aware recall with provenance inside the configured 12k budget", () => {
+      const matches = [
+        ...Array.from({ length: 4 }, (_, i) => m({ id: `direct-${i}`, content: "direct evidence ".repeat(500) })),
+        m({
+          id: "linked-answer",
+          content: "linked causal evidence ".repeat(500),
+          hop: 1,
+          viaFrom: "candidate-root",
+          viaType: "decided",
+          viaProvenance: "explicit",
+          viaLinkedAt: 1700000000000,
+        }),
+      ];
+
+      const out = renderRecallText(matches, "");
+
+      expect(out.length).toBeLessThanOrEqual(12000);
+      expect(out).toContain("ID: linked-answer");
+      expect(out).toContain("[related · you linked");
     });
 
     it("always returns at least one match even when that match alone is huge", () => {

@@ -1,5 +1,40 @@
 export const LLM_MODEL = "@cf/meta/llama-4-scout-17b-16e-instruct";
 
+/**
+ * Model for `reasonOverPair` (src/insight/reason.ts) only — every other call
+ * (classification, contradiction detection, smart merge, digests, recall
+ * synthesis) keeps using `LLM_MODEL` above. Insight reasoning is a harder
+ * judgment task than any of those: it has to read two memories written
+ * months apart and decide whether there is a real, specific tension or
+ * connection between them, not just extract or summarize. That deserves a
+ * stronger model, but repointing the shared `LLM_MODEL` would change cost
+ * and behaviour for five unrelated features for every user, so this is a
+ * separate setting instead.
+ *
+ * Cost, worked from Cloudflare's published Workers AI neuron pricing (one
+ * neuron per ~$0.011, at time of writing):
+ *
+ *   - LLM_MODEL default, @cf/meta/llama-4-scout-17b-16e-instruct:
+ *     24,545 neurons/M input tokens, 77,273 neurons/M output tokens.
+ *   - @cf/openai/gpt-oss-120b: 31,818 neurons/M input, 68,182 neurons/M output.
+ *
+ * gpt-oss-120b costs MORE per input token and LESS per output token. This
+ * pass's shape (~550 input tokens, 200 output tokens per candidate, from the
+ * ENTRY_EXCERPT_CHARS-bounded prompt in reason.ts) is output-light, so the
+ * two effects mostly cancel:
+ *
+ *   scout:   550 * 24545/1e6 + 200 * 77273/1e6 ≈ 13.5 + 15.5 ≈ 29.0 neurons
+ *   gpt-oss: 550 * 31818/1e6 + 200 * 68182/1e6 ≈ 17.5 + 13.6 ≈ 31.1 neurons
+ *
+ * ~7% more neurons for a model with roughly seven times the parameters. The
+ * weekly pass reasons over at most WEEKLY_CANDIDATE_LIMIT (10) candidates —
+ * see src/insight/weekly.ts — so a full week costs ~311 neurons, about 0.44%
+ * of the 10,000-neuron/day free allocation. Re-derive rather than trust this
+ * if either model's price or `ENTRY_EXCERPT_CHARS` / `INSIGHT_PASS_MAX_TOKENS`
+ * below change.
+ */
+export const INSIGHT_LLM_MODEL = "@cf/openai/gpt-oss-120b";
+
 export const DUPLICATE_BLOCK_THRESHOLD = 0.95;
 export const DUPLICATE_FLAG_THRESHOLD = 0.85;
 export const CANDIDATE_SCORE_THRESHOLD = 0.45;
@@ -12,6 +47,35 @@ export const CONTRADICTION_IMPORTANCE_STEP = 1.0;
 export const EMBEDDING_MODEL = "@cf/baai/bge-small-en-v1.5";
 
 export const CHUNK_MAX_CHARS = 1600;
+
+// Sources that mirror an external system rather than record a thought.
+//
+// Lives here, not in `integrations/`, because `capture/store.ts` reads it and
+// `integrations/mirror.ts` already imports `capture/store.ts` — the dependency
+// must not run both ways. `test/unit/store-mirrored-chunks.test.ts` asserts this
+// covers every id in INTEGRATION_PROVIDERS, which a test may import from both
+// sides freely; that guard exists because the equivalent hand-written list in
+// `insight/eligibility.ts` had silently fallen three providers behind.
+//
+// `git-hook` and `obsidian` are external clients that write memories rather than
+// registered providers, so they are named here and cannot be derived.
+export const MIRRORED_SOURCES: ReadonlySet<string> = new Set([
+  "calendar-google", "calendar-outlook", "calendar-icloud",
+  "email-gmail", "email-icloud",
+  "notion", "git-hook", "obsidian",
+]);
+
+// Sources that record a conversation rather than a thought — a client pasting
+// in the tail of a session. A transcript restates whatever was said, including
+// memories the same session stored deliberately, so it will score as a near
+// duplicate or a contradiction of them. It must never be the thing that
+// rewrites or deprecates a memory another source wrote. Same-source collisions
+// (a resumed session superseding its own earlier capture) are still allowed.
+//
+// Not MIRRORED_SOURCES: those index the first chunk only because the record
+// leads with signal and trails with boilerplate; a transcript is the inverse.
+export const TRANSCRIPT_SOURCES: ReadonlySet<string> = new Set(["claude-code"]);
+
 // ── Embedding migration (#248) ───────────────────────────────────────────────
 // Budgeted in chunks rather than entries because storeEntry fires one model call
 // per chunk, all concurrently: 25 single-chunk entries is already ~75 binding
@@ -26,11 +90,26 @@ export const CLASSIFY_MAX_TOKENS = 80;
 export const CONTRADICTION_MAX_TOKENS = 80;
 export const SMART_MERGE_MAX_TOKENS = 250;
 export const INSIGHT_MAX_TOKENS = 300;
-export const PATTERN_MAX_TOKENS = 100;
+// max_tokens is a CEILING, not a target. A non-reasoning model stops at its
+// own natural answer length well under this cap, so raising it costs that
+// model nothing extra. But INSIGHT_LLM_MODEL's default, @cf/openai/gpt-oss-120b,
+// is a reasoning model: it spends tokens on chain-of-thought (streamed as
+// `delta.reasoning` / `delta.reasoning_content`, see readStreamText in
+// src/lib/ai.ts) before it ever emits an answer. At 200 it could burn the
+// entire budget thinking and reach the cap without emitting an answer at
+// all — the pass would then silently return nothing. 1200 gives it enough
+// headroom to finish reasoning and still answer.
+export const INSIGHT_PASS_MAX_TOKENS = 1200;
 export const DIGEST_MAX_TOKENS = 400;
 
 export const VECTORIZE_FIX_HINT =
   "run `npx wrangler vectorize create second-brain-vectors --dimensions=384 --metric=cosine`, or grant the build token Vectorize Edit and redeploy";
+
+// Durable marker written once, by src/recall/search.ts and src/capture/duplicate.ts,
+// the first time this isolate's workspace-filter latch (src/vectorize/scope.ts)
+// trips to unsupported. GET /health reads it back so the signal survives isolate
+// churn — the in-memory latch alone would look healthy again on every cold start.
+export const VECTORIZE_WORKSPACE_FILTER_UNSUPPORTED_KV_KEY = "vectorize:workspace-filter-unsupported";
 
 export const VECTORIZE_TOP_K_MULTIPLIER = 3;
 // getByIds batch size for tag-scoped recall — Vectorize rejects more than 20 IDs
@@ -71,4 +150,23 @@ export const KEYWORD_STOPWORDS = new Set([
   "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "is", "are", "was", "were", "be", "been",
   "i", "me", "my", "we", "you", "it", "this", "that", "these", "those", "with", "about", "from", "at", "as", "by",
   "do", "did", "does", "what", "when", "where", "who", "whom", "how", "why", "which",
+]);
+
+// Function words for the scripts Intl.Segmenter splits without spaces (#326).
+// KEYWORD_STOPWORDS never matches them, and without this a Japanese question
+// spends its keyword slots on auxiliaries and particles (した, ている, ため)
+// that occur in nearly every note. One-character particles (は, を, の) need no
+// entry: they fall to KEYWORD_MIN_TOKEN_LEN. Segmenter mis-splits of the most
+// common request forms (教えて → 教え|て, ください → くだ|さい) are listed so
+// they do not surface as content words.
+export const CJK_STOPWORDS = new Set([
+  // Japanese
+  "した", "して", "する", "します", "しました", "され", "された", "される", "です", "でした", "ます", "ません",
+  "ない", "なく", "ある", "あり", "いる", "いた", "ている", "ていた", "なる", "なった", "できる",
+  "こと", "もの", "これ", "それ", "あれ", "この", "その", "あの", "ここ", "そこ", "どこ",
+  "ため", "から", "まで", "など", "より", "また", "でも", "けど", "ので", "のに", "について", "という",
+  "ください", "くだ", "さい", "教えて", "教え", "なぜ", "どう", "どの", "いつ", "だれ", "なに", "ような", "ように",
+  // Chinese
+  "什么", "怎么", "为什么", "没有", "可以", "一个", "我们", "你们", "他们", "这个", "那个", "这些", "那些",
+  "因为", "所以", "但是", "如果", "已经", "还是", "或者", "以及", "关于",
 ]);

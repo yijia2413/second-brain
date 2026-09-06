@@ -1,5 +1,15 @@
 function init() {
+  // First, so no authenticated request can outrun it: a token revoked while the
+  // window sat open has to end the session rather than be swallowed. See
+  // installAuthWatch in js/auth.js.
+  installAuthWatch()
+  initI18n()
+  applyI18nDom()
   applyTheme()
+  applyLocale()
+  // Before anything renders, so the Memories screen is already showing the
+  // projection this user last chose rather than snapping to it after paint.
+  initMemoryView()
   if (typeof renderAboutCredits === 'function') renderAboutCredits()
   if (typeof renderDownloadButton === 'function') renderDownloadButton()
   // Auto-populate URL from the current page origin (UI is hosted on the same Worker)
@@ -32,6 +42,9 @@ document.getElementById('view-sheet').addEventListener('click', (e) => {
 })
 document.getElementById('edit-sheet').addEventListener('click', (e) => {
   if (e.target === document.getElementById('edit-sheet')) closeEdit()
+})
+document.getElementById('patterns-sheet').addEventListener('click', (e) => {
+  if (e.target === document.getElementById('patterns-sheet')) closePatternsSheet()
 })
 
 init()

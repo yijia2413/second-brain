@@ -67,15 +67,27 @@ const STALL_ENV: &str = "SECOND_BRAIN_DEMO_STALL_AFTER";
 /// flow wants the rotation over with.
 ///
 /// **Rotation only** — see [`Demo::deployed_with`]. A password that arrives with
-/// a deploy has nothing to propagate, and delaying that one instead pointed the
-/// knob at `provision`'s health poll, where a 401 is terminal: exporting this
-/// variable made first-time demo setup die with "Something went wrong".
+/// a deploy propagates through [`DEPLOY_ENV`] instead.
 const ROTATE_ENV: &str = "SECOND_BRAIN_DEMO_ROTATE_AFTER";
 
-/// Shipped in `src/config.ts` DEFAULTS. Both must be values the pickers offer,
-/// or the settings window shows a model that is not in its own dropdown and the
-/// migration pane cannot read the current dimensions — asserted in tests.
+/// Set to an attempt count to make a *deployed* password take that many
+/// refusals before it works.
+///
+/// A real redeploy is not atomic at the edge: every node keeps serving the
+/// previous version, holding the previous `AUTH_TOKEN`, until the new upload
+/// reaches it. The installer's health poll can therefore hit a brain that
+/// genuinely refuses the password the upload metadata carried — the state
+/// behind discussion #315 — and what the poll does with that refusal is exactly
+/// what had to change. Off by default: a deploy really does carry the secret
+/// with it, and every other demo flow wants setup over with on the first ask.
+const DEPLOY_ENV: &str = "SECOND_BRAIN_DEMO_DEPLOY_AFTER";
+
+/// Shipped in `src/config.ts` DEFAULTS. All three must be values the pickers
+/// offer, or the settings window shows a model that is not in its own dropdown
+/// and the migration pane cannot read the current dimensions — asserted in
+/// tests.
 const DEMO_LLM_MODEL: &str = "@cf/meta/llama-4-scout-17b-16e-instruct";
+const DEMO_INSIGHT_LLM_MODEL: &str = "@cf/openai/gpt-oss-120b";
 const DEMO_EMBEDDING_MODEL: &str = "@cf/baai/bge-small-en-v1.5";
 
 /// Returned when loopback cannot be bound at all. Port 1 refuses instantly, so
@@ -108,6 +120,9 @@ pub struct Options {
     /// Refuse a newly rotated password this many times before honouring it, so
     /// the health gate's retry loop has something to retry through.
     pub rotate_after: Option<u64>,
+    /// Refuse a freshly *deployed* password this many times, standing in for
+    /// edge nodes still serving the previous deployment — see [`DEPLOY_ENV`].
+    pub deploy_after: Option<u64>,
     /// How many AI tools this brain believes are connected through the browser
     /// OAuth flow, before anything disconnects them.
     ///
@@ -126,7 +141,8 @@ impl Default for Options {
             batch_entries: BATCH_ENTRIES,
             batch_pause: BATCH_PAUSE,
             stall_after: parse_stall_after(std::env::var(STALL_ENV).ok().as_deref()),
-            rotate_after: parse_rotate_after(std::env::var(ROTATE_ENV).ok().as_deref()),
+            rotate_after: parse_pending_attempts(std::env::var(ROTATE_ENV).ok().as_deref()),
+            deploy_after: parse_pending_attempts(std::env::var(DEPLOY_ENV).ok().as_deref()),
             oauth_connections: OAUTH_CONNECTIONS,
         }
     }
@@ -141,7 +157,9 @@ fn parse_stall_after(raw: Option<&str>) -> Option<u64> {
 }
 
 /// Split out from the env read for the same reason as [`parse_stall_after`].
-fn parse_rotate_after(raw: Option<&str>) -> Option<u64> {
+/// Shared by both password knobs — rotation's and deploy's — since the shape
+/// (attempts of refusal, zero means off) is the same.
+fn parse_pending_attempts(raw: Option<&str>) -> Option<u64> {
     // 0 refusals is the default behaviour — the new password lands at once — so
     // it reads as "off" rather than as a delay of no length.
     positive_count(raw)
@@ -172,6 +190,7 @@ pub fn shipped_config() -> Map<String, Value> {
         out.extend(patch);
     }
     out.insert("LLM_MODEL".into(), json!(DEMO_LLM_MODEL));
+    out.insert("INSIGHT_LLM_MODEL".into(), json!(DEMO_INSIGHT_LLM_MODEL));
     out.insert("EMBEDDING_MODEL".into(), json!(DEMO_EMBEDDING_MODEL));
     out
 }
@@ -307,6 +326,15 @@ impl Demo {
     fn handle(&self, method: &str, path: &str, body: &str) -> (u16, Value) {
         match (method, path) {
             ("GET", "/health") => (200, self.health()),
+            // The demo brain is its own owner: it answers to one token and that
+            // token is the deployment's. Shaped exactly like src/routes/admin.ts
+            // returns it, because the Connection details window reads this to
+            // decide whether to offer a password change.
+            ("GET", "/team/me") => (
+                200,
+                json!({ "ok": true, "profile": { "role": "admin", "owner": true } }),
+            ),
+            ("POST", "/capture") => (200, json!({ "ok": true })),
             ("GET", "/config") => (200, self.config_body()),
             ("PATCH", "/config") => self.patch_config(body),
             ("DELETE", p) if p.starts_with("/config/") => {
@@ -359,6 +387,7 @@ impl Demo {
                     &manifest.vectorize_name,
                     dimensions,
                     manifest.vectorize_dimensions,
+                    Some(&model),
                 ),
                 "dimensions": dimensions,
                 "vectorCount": self.options.chunks_at_least,
@@ -550,16 +579,16 @@ impl Demo {
     /// Makes `token` the only password this brain accepts, **now**.
     ///
     /// A fresh deploy carries `AUTH_TOKEN` as a binding in its upload metadata,
-    /// so the Worker comes up already holding it: there is no propagation window
-    /// because there was no separate secret write to propagate.
+    /// so the Worker comes up already holding it: normally there is no
+    /// propagation window, because there was no separate secret write to
+    /// propagate. [`DEPLOY_ENV`] reintroduces one on purpose — real edge nodes
+    /// keep serving the previous deployment for a few seconds — so the health
+    /// poll's treatment of a refusal is exercised rather than assumed.
     ///
-    /// Split from [`Self::rotate_to`] because [`ROTATE_ENV`] must reach one and
-    /// not the other. Applying the delay to a deploy aims it at `provision`'s
-    /// health poll, which treats a 401 as terminal — so with the variable
-    /// exported, first-time demo setup failed with "Something went wrong" and
-    /// the retry loop the variable exists to exercise was never reached.
+    /// Split from [`Self::rotate_to`] because each knob must reach one and not
+    /// the other.
     fn deployed_with(&self, token: &str) {
-        self.set_password(token, 0);
+        self.set_password(token, self.options.deploy_after.unwrap_or(0));
     }
 
     fn set_password(&self, token: &str, pending: u64) {
@@ -831,6 +860,7 @@ pub fn test_options() -> Options {
         batch_pause: Duration::ZERO,
         stall_after: None,
         rotate_after: None,
+        deploy_after: None,
         ..Options::default()
     }
 }
@@ -1031,17 +1061,22 @@ mod tests {
             );
         }
         assert_eq!(view.llm_model, DEMO_LLM_MODEL);
+        assert_eq!(view.insight_llm_model, DEMO_INSIGHT_LLM_MODEL);
     }
 
-    /// The two models must be ones the pickers offer. An LLM_MODEL outside
-    /// `LLM_MODELS` renders an empty dropdown selection; an EMBEDDING_MODEL
-    /// outside `EMBEDDING_MODELS` leaves `oldDimensions` null, which makes the
-    /// last migration step unreachable.
+    /// The three models must be ones the pickers offer. An LLM_MODEL or
+    /// INSIGHT_LLM_MODEL outside `LLM_MODELS` renders an empty dropdown
+    /// selection; an EMBEDDING_MODEL outside `EMBEDDING_MODELS` leaves
+    /// `oldDimensions` null, which makes the last migration step unreachable.
     #[test]
-    fn both_demo_models_are_offered_by_the_pickers() {
+    fn all_demo_models_are_offered_by_the_pickers() {
         assert!(
             settings::LLM_MODELS.contains(&DEMO_LLM_MODEL),
             "{DEMO_LLM_MODEL} is not in the dropdown"
+        );
+        assert!(
+            settings::LLM_MODELS.contains(&DEMO_INSIGHT_LLM_MODEL),
+            "{DEMO_INSIGHT_LLM_MODEL} is not in the dropdown"
         );
         assert!(
             crate::migration::dimensions_for(DEMO_EMBEDDING_MODEL).is_some(),
@@ -1065,10 +1100,14 @@ mod tests {
                 "{key} is not a Worker default — the demo reports a setting that does not exist"
             );
         }
-        // And the two model strings must be the shipped ones, not a guess.
+        // And the three model strings must be the shipped ones, not a guess.
         assert!(
             defaults.contains(&format!("LLM_MODEL: \"{DEMO_LLM_MODEL}\"")),
             "LLM_MODEL drifted from src/config.ts"
+        );
+        assert!(
+            defaults.contains(&format!("INSIGHT_LLM_MODEL: \"{DEMO_INSIGHT_LLM_MODEL}\"")),
+            "INSIGHT_LLM_MODEL drifted from src/config.ts"
         );
         assert!(
             defaults.contains(&format!("EMBEDDING_MODEL: \"{DEMO_EMBEDDING_MODEL}\"")),
@@ -1103,6 +1142,7 @@ mod tests {
             &[("variety".into(), "varied".into())],
             &[],
             None,
+            None,
             Locale::En,
         )
         .await
@@ -1115,6 +1155,32 @@ mod tests {
         // ...and only that control moved.
         let detail = view.controls.iter().find(|c| c.id == "detail").expect("detail");
         assert_eq!(detail.level.as_deref(), Some("standard"));
+    }
+
+    /// The insight model has its own save path, separate from `LLM_MODEL` — this
+    /// proves a save actually reaches the Worker and comes back on the next read,
+    /// the same round trip `a_saved_level_is_what_the_next_read_reports` proves
+    /// for a level.
+    #[tokio::test]
+    async fn a_saved_insight_model_is_what_the_next_read_reports() {
+        let url = brain();
+        settings::apply_settings(
+            &url,
+            "demo",
+            &[],
+            &[],
+            None,
+            Some("@cf/qwen/qwen2.5-coder-32b-instruct".into()),
+            Locale::En,
+        )
+        .await
+        .expect("save");
+
+        let view = settings::fetch_settings(&url, "demo", Locale::En).await.expect("view");
+        assert_eq!(view.insight_llm_model, "@cf/qwen/qwen2.5-coder-32b-instruct");
+
+        // ...and the general-purpose model must be untouched by an insight-only save.
+        assert_eq!(view.llm_model, DEMO_LLM_MODEL);
     }
 
     #[tokio::test]
@@ -1139,6 +1205,7 @@ mod tests {
             "demo",
             &[("recency".into(), "recent_first".into())],
             &[],
+            None,
             None,
             Locale::En,
         )
@@ -1435,13 +1502,13 @@ mod tests {
 
     #[test]
     fn the_rotation_delay_is_off_unless_the_env_var_names_an_attempt_count() {
-        assert_eq!(parse_rotate_after(None), None);
-        assert_eq!(parse_rotate_after(Some("")), None);
-        assert_eq!(parse_rotate_after(Some("nonsense")), None);
+        assert_eq!(parse_pending_attempts(None), None);
+        assert_eq!(parse_pending_attempts(Some("")), None);
+        assert_eq!(parse_pending_attempts(Some("nonsense")), None);
         // Landing at once is the default, not a delay of no length.
-        assert_eq!(parse_rotate_after(Some("0")), None);
-        assert_eq!(parse_rotate_after(Some("2")), Some(2));
-        assert_eq!(parse_rotate_after(Some(" 2 ")), Some(2));
+        assert_eq!(parse_pending_attempts(Some("0")), None);
+        assert_eq!(parse_pending_attempts(Some("2")), Some(2));
+        assert_eq!(parse_pending_attempts(Some(" 2 ")), Some(2));
     }
 
     /// `rotate_to` has to reach the brain the app is talking to, not an instance
