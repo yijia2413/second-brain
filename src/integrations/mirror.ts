@@ -4,14 +4,14 @@ import {
   INTEGRATION_PROVIDERS,
   getProvider,
   loadIntegration,
-  saveIntegration,
+  updateIntegration,
   deleteIntegration,
 } from "../integrations";
 import type { IntegrationProvider, MirrorStore } from "./framework";
 import { narrowMirrorLayer } from "./framework";
 import { initializeDatabase } from "../db/init";
 import { forgetEntry } from "../capture/lifecycle";
-import { deleteStaleVectors, storeEntry } from "../capture/store";
+import { deleteStaleVectors, embedContextForRow, storeEntry } from "../capture/store";
 import { classifyEntry } from "../capture/classify";
 import { withKind } from "../memory/kind";
 import { withStatus } from "../memory/status";
@@ -21,7 +21,7 @@ import { OWNER_WRITE_CONTEXT, scopeWrite, type WriteContext } from "../lib/scope
 import { resolveIdentityByUserId } from "../lib/identity";
 import { ensureTenantBootstrap } from "../lib/tenancy";
 
-export function makeMirrorStore(env: Env, writeCtx: WriteContext = OWNER_WRITE_CONTEXT): MirrorStore {
+export function makeMirrorStore(env: Env, writeCtx: WriteContext = OWNER_WRITE_CONTEXT, resolved?: Readonly<Config>): MirrorStore {
   // The write context is a property of the store rather than of each method because
   // the MirrorStore interface (integrations/framework.ts) is shared with providers
   // that must not learn about tenancy. A sync batch is one actor's work, so one
@@ -37,7 +37,7 @@ export function makeMirrorStore(env: Env, writeCtx: WriteContext = OWNER_WRITE_C
   // rather than the value is what makes concurrent writes share one read;
   // resolveConfig degrades to the defaults instead of rejecting, so there is no
   // failure to latch.
-  let pending: Promise<Readonly<Config>> | null = null;
+  let pending: Promise<Readonly<Config>> | null = resolved ? Promise.resolve(resolved) : null;
   const config = () => (pending ??= resolveConfig(env));
 
   return {
@@ -84,7 +84,7 @@ export function makeMirrorStore(env: Env, writeCtx: WriteContext = OWNER_WRITE_C
     async updateEntry(id, content) {
       const row = await env.DB.prepare(
         // scope-exempt: by-id: the mirrored row this connector wrote
-        `SELECT tags, source, vector_ids FROM entries WHERE id = ?`
+        `SELECT tags, source, vector_ids, workspace_id FROM entries WHERE id = ?`
       ).bind(id).first() as Record<string, any> | null;
       if (!row) return false;
 
@@ -97,9 +97,14 @@ export function makeMirrorStore(env: Env, writeCtx: WriteContext = OWNER_WRITE_C
       await env.DB.prepare(`UPDATE entries SET content = ?, tags = ?, updated_at = ? WHERE id = ?`)
         .bind(content, JSON.stringify(refreshedTags), now, id).run();
       const cfg = await config();
+      // The sync's write context decides where a NEW mirror goes (createEntry).
+      // An UPDATE refreshes a row whose home is already decided and may have moved
+      // since this batch's context was resolved (#351) — stamp from the row itself,
+      // exactly as the manual-edit path does.
+      const embedCtx = embedContextForRow(row, writeCtx);
       let newVectorIds: string[] = [];
       try {
-        newVectorIds = (await storeEntry(env, id, content, refreshedTags, row.source as string, now, cfg, writeCtx)).vectorIds;
+        newVectorIds = (await storeEntry(env, id, content, refreshedTags, row.source as string, now, cfg, embedCtx)).vectorIds;
       } catch (e) {
         console.error("Vectorize re-embed failed (non-fatal):", e);
       }
@@ -179,7 +184,7 @@ const CRON_SYNC_MAX_BATCHES = 1;
  * advanceRotationCursor. Under rotation a provider that never advances is not a
  * slow provider, it is a stuck queue.
  */
-export async function runScheduledIntegrationSync(env: Env): Promise<void> {
+export async function runScheduledIntegrationSync(env: Env, resolved?: Readonly<Config>): Promise<void> {
   let due: IntegrationProvider | null = null;
   let dueSince = Infinity;
   for (const provider of Object.values(INTEGRATION_PROVIDERS)) {
@@ -197,7 +202,7 @@ export async function runScheduledIntegrationSync(env: Env): Promise<void> {
 
   await initializeDatabase(env);
   const record = await loadIntegration(env, due.id);
-  const store = makeMirrorStore(env, await mirrorWriteContext(env, record));
+  const store = makeMirrorStore(env, await mirrorWriteContext(env, record), resolved);
   try {
     for (let i = 0; i < CRON_SYNC_MAX_BATCHES; i++) {
       const result = await due.sync(env, store);
@@ -265,10 +270,8 @@ export async function mirrorWriteContext(
  */
 async function advanceRotationCursor(env: Env, providerId: string): Promise<void> {
   try {
-    const record = await loadIntegration(env, providerId);
-    if (!record) return; // disconnected mid-run — nothing to advance
-    record.updatedAt = Date.now();
-    await saveIntegration(env, record);
+    // null when disconnected mid-run — nothing to advance.
+    await updateIntegration(env, providerId, (r) => { r.updatedAt = Date.now(); });
   } catch (e) {
     console.error(`Integration rotation cursor did not advance for ${providerId} (non-fatal):`, e);
   }
